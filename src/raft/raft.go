@@ -1,5 +1,5 @@
 package raft
-
+// Hello
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
