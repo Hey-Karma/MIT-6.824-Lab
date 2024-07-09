@@ -310,7 +310,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		rf.condApply.Signal()
 		return
 	}
-
+	// reply.Success 已经是 false 了
 	if reply.Term > rf.currentTerm {
 		DPrintf("server %v 旧的leader收到了心跳函数中更新的term: %v,转化为Follower\n", rf.me, reply.Term)
 		rf.currentTerm = reply.Term
@@ -329,21 +329,26 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		if reply.XTerm == -1 {
 			// PrevLogIndex这个位置在Follwer中不存在
 			DPrintf("leader %v 收到 server %v 的回退请求, 原因是log过短, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, serverTo, rf.nextIndex[serverTo], serverTo, reply.XLen)
-			rf.nextIndex[serverTo] = reply.XLen
+			if rf.lastIncludedIndex >= reply.XLen {
+				// 由于snapshot被截断
+				go rf.handleInstallSnapshot(serverTo)
+			} else {
+				rf.nextIndex[serverTo] = reply.XLen
+			}
 			return
 		}
 
 		i := rf.nextIndex[serverTo] - 1
-		for i > 0 && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
+		// 回退到小于等于reply的Xterm的地方
+		for i > rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
 			i -= 1
 		}
-		if rf.log[i].Term == reply.XTerm {
+		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
+			go rf.handleInstallSnapshot(serverTo)
+		} else if rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
+			//
 			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
-			rf.nextIndex[serverTo] = i + 1
-		} else {
-			// Leader从没有过XTerm
-			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
-			rf.nextIndex[serverTo] = reply.XIndex
+
 		}
 		return
 	}
