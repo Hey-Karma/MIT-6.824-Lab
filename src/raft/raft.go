@@ -346,7 +346,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
 			go rf.handleInstallSnapshot(serverTo)
 		} else if rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
-			//
+			// 之前PrevLogIndex发生冲突的位置，Follower也有那个Term
 			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
 
 		}
