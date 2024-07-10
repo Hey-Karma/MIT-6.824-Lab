@@ -150,7 +150,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(raftState, rf.snapShot)
 }
 
 // restore previously persisted state.
@@ -321,7 +321,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	} else {
 		DPrintf("server %v InstallSnapshot: 清空log\n", rf.me)
 		rf.log = make([]Entry, 0)
-		rf.log = append(rf.log, Entry{Term: rf.lastIncludedIndex, Cmd: args.LastIncludedCmd})
+		rf.log = append(rf.log, Entry{Term: rf.lastIncludedTerm, Cmd: args.LastIncludedCmd})
 	}
 
 	rf.snapShot = args.Data
@@ -447,6 +447,9 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 
 		i := rf.nextIndex[serverTo] - 1
 		// 回退到小于等于reply的Xterm的地方
+		if i < rf.lastIncludedIndex {
+			i = rf.lastIncludedIndex
+		}
 		for i > rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
 			i -= 1
 		}
@@ -520,6 +523,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			i -= 1
 		}
 		reply.XIndex = i + 1
+		reply.XLen = rf.VirtualLogIdx(len(rf.log))
 		isConflict = true
 		DPrintf("server %v 的log在PrevLogIndex: %v 位置Term不匹配, args.Term=%v, 实际的term=%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply.XTerm)
 	}
@@ -671,7 +675,7 @@ func (rf *Raft) CommitChecker() {
 		}
 		msgBuf := make([]*ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		tmpApplied := rf.lastApplied
-		for rf.commitIndex > rf.lastApplied {
+		for rf.commitIndex > tmpApplied {
 			tmpApplied++
 			if tmpApplied <= rf.lastIncludedIndex {
 				// tmpApplied可能是snapshot中已经被截断的日志项
@@ -737,30 +741,22 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	//rd := rand.New(rand.NewSource(int64(rf.me)))
-	for rf.killed() == false {
-
+	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		// rdTimeOut := GetRandomElectTimeOut(rd)
-		// DPrintf("rf.me(%v) 的超时时间为:%v", rf.me, rdTimeOut)
-		// rf.mu.Lock()
-		// if rf.role != Leader && time.Since(rf.timeStamp) > time.Duration(rdTimeOut)*time.Millisecond {
-		// 	go rf.Elect()
-		// }
-		// rf.mu.Unlock()
+
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		// ms := 50 + (rand.Int63() % 300)
-		// time.Sleep(time.Duration(ms) * time.Millisecond)
-		// time.Sleep(ElectTimeOutCheckInterval)
 		<-rf.timer.C
 		rf.mu.Lock()
+		// DPrintf("server %v ticker 获取锁mu", rf.me)
 		if rf.role != Leader {
+			// 超时
 			go rf.Elect()
 		}
 		rf.ResetTimer()
 		rf.mu.Unlock()
+		// DPrintf("server %v ticker 释放锁mu", rf.me)
 	}
 }
 
@@ -930,6 +926,7 @@ type InstallSnapshotReply struct {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	DPrintf("server %v 调用Make启动", me)
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -959,7 +956,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 	go rf.CommitChecker()
 
 	return rf
