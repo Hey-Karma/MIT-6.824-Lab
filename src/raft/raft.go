@@ -87,7 +87,7 @@ type Raft struct {
 
 	commitIndex int           // 将要提交的日志的最高索引
 	lastApplied int           // 已经被应用到状态机的日志的最高索引
-	nextIndex   []int         // 复制到某一个follower时, log开始的索引
+	nextIndex   []int         // 复制到某一个follower时, log开始的索引,当新的Leader当选以后，会将此初始化为自己的最后一条log+1的位置，后续可以通过心跳来更新正确的nextindex
 	matchIndex  []int         // 已经被复制到follower的日志的最高索引
 	applyCh     chan ApplyMsg // 用于在应用到状态机时传递消息
 	// 记录心跳
@@ -233,6 +233,113 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func (rf *Raft) handleInstallSnapshot(serverTo int) {
+	reply := &InstallSnapshotReply{}
+
+	rf.mu.Lock()
+	if rf.role != Leader {
+		// 自己已经不是Leader
+		rf.mu.Unlock()
+		return
+	}
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Data:              rf.snapShot,
+		LastIncludedCmd:   rf.log[0].Cmd,
+	}
+	rf.mu.Unlock()
+
+	// 发送RPC时不要持有锁
+	ok := rf.sendInstallSnapshot(serverTo, args, reply)
+	if !ok {
+		return
+	}
+
+	rf.mu.Lock()
+	defer func() { rf.mu.Unlock() }()
+	if reply.Term > rf.currentTerm {
+		// 自己是旧的Leader
+		rf.currentTerm = reply.Term
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.ResetTimer()
+		rf.persist()
+		return
+	}
+	rf.nextIndex[serverTo] = rf.VirtualLogIdx(1)
+}
+
+func (rf *Raft) sendInstallSnapshot(serverTo int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[serverTo].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer func() {
+		rf.ResetTimer()
+		rf.mu.Unlock()
+		DPrintf("server %v 接收到 leader %v 的InstallSnapshot, 重设定时器", rf.me, args.LeaderId)
+	}()
+
+	// 如果传过来的Term 小于当前Raft节点的 Term 直接返回
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		DPrintf("server %v 拒绝来自 %v 的 InstallSnapshot, 更小的Term\n", rf.me, args.LeaderId)
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		DPrintf("server %v 接受来自 %v 的 InstallSnapshot, 且发现了更大的Term\n", rf.me, args.LeaderId)
+	}
+	rf.role = Follower
+
+	// 如果现有的log存在和snapshot相同的index和Term的log条目，那么保留index之后的条目后返回
+	hasEntry := false
+	rIdx := 0
+	for ; rIdx < len(rf.log); rIdx++ {
+		if rf.VirtualLogIdx(rIdx) == args.LastIncludedIndex && rf.log[rIdx].Term == args.LastIncludedTerm {
+			hasEntry = true
+			break
+		}
+	}
+	msg := &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+
+	if hasEntry {
+		DPrintf("server %v InstallSnapshot: args.LastIncludedIndex= %v 位置存在, 保留后面的log\n", rf.me, args.LastIncludedIndex)
+		rf.log = rf.log[rIdx:]
+	} else {
+		DPrintf("server %v InstallSnapshot: 清空log\n", rf.me)
+		rf.log = make([]Entry, 0)
+		rf.log = append(rf.log, Entry{Term: rf.lastIncludedIndex, Cmd: args.LastIncludedCmd})
+	}
+
+	rf.snapShot = args.Data
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	reply.Term = rf.currentTerm
+	rf.applyCh <- *msg
+	rf.persist()
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -310,7 +417,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		rf.condApply.Signal()
 		return
 	}
-	// reply.Success 已经是 false 了
+	// reply.Success 已经是 false 了 是false的几种情况：1.Term不符 2.PrevLogIndex不存在log 3.
 	if reply.Term > rf.currentTerm {
 		DPrintf("server %v 旧的leader收到了心跳函数中更新的term: %v,转化为Follower\n", rf.me, reply.Term)
 		rf.currentTerm = reply.Term
@@ -344,11 +451,21 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 			i -= 1
 		}
 		if i == rf.lastIncludedIndex && rf.log[rf.RealLogIdx(i)].Term > reply.XTerm {
+			// 要找的位置已经被snapshot截断了
 			go rf.handleInstallSnapshot(serverTo)
 		} else if rf.log[rf.RealLogIdx(i)].Term == reply.XTerm {
 			// 之前PrevLogIndex发生冲突的位置，Follower也有那个Term
 			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
-
+			rf.nextIndex[serverTo] = i + 1
+		} else {
+			// 之前PrevLogIndex发生冲突的位置的Term Leader没有这个Term
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
+			if reply.XIndex <= rf.lastIncludedIndex {
+				// 已经被snapshot截断了
+				go rf.handleInstallSnapshot(serverTo)
+			} else {
+				rf.nextIndex[serverTo] = reply.XIndex
+			}
 		}
 		return
 	}
@@ -552,18 +669,51 @@ func (rf *Raft) CommitChecker() {
 		for rf.commitIndex <= rf.lastApplied {
 			rf.condApply.Wait()
 		}
+		msgBuf := make([]*ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		tmpApplied := rf.lastApplied
 		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied += 1
+			tmpApplied++
+			if tmpApplied <= rf.lastIncludedIndex {
+				// tmpApplied可能是snapshot中已经被截断的日志项
+				continue
+			}
 			msg := &ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Cmd,
-				CommandIndex: rf.lastApplied,
+				Command:      rf.log[rf.RealLogIdx(tmpApplied)].Cmd,
+				CommandIndex: tmpApplied,
+				SnapshotTerm: rf.log[rf.RealLogIdx(tmpApplied)].Term,
 			}
-			rf.applyCh <- *msg
-			DPrintf("server %v 准备将命令 %v(索引为 %v) 应用到状态机\n", rf.me, msg.Command, msg.CommandIndex)
+			msgBuf = append(msgBuf, msg)
+			//DPrintf("server %v 准备将命令 %v(索引为 %v) 应用到状态机\n", rf.me, msg.Command, msg.CommandIndex)
 		}
 		rf.mu.Unlock()
+
 		//time.Sleep(CommitCheckTimeInterval)
+
+		// 解锁后可能又出现了Snapshot进而修改了rf.lastApplied
+		for _, msg := range msgBuf {
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 {
+				rf.mu.Unlock()
+				continue
+			}
+			DPrintf("server %v 准备commit, log = %v:%v, lastIncludedIndex=%v", rf.me, msg.CommandIndex, msg.SnapshotTerm, rf.lastIncludedIndex)
+
+			rf.mu.Unlock()
+			// 注意解锁后又有可能出现SnapShot进而修改了rf.lastApplied
+			rf.applyCh <- *msg
+
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.lastApplied = msg.CommandIndex
+			rf.mu.Unlock()
+
+			// 每次取出一个msg后更新lastApplied
+			rf.lastApplied = msg.CommandIndex
+		}
 	}
 }
 
@@ -663,8 +813,9 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 		DPrintf("server %v 当选为Leader,Term为: %v \n", rf.me, rf.currentTerm)
 		// 需要重新初始化nextIndex和matchIndex
 		for i := 0; i < len(rf.nextIndex); i++ {
+			// 将nextindex都初始化为自己log最后一项+1
 			rf.nextIndex[i] = rf.VirtualLogIdx(len(rf.log))
-			rf.matchIndex[i] = 0
+			rf.matchIndex[i] = rf.lastIncludedIndex
 		}
 		rf.mu.Unlock()
 		go rf.SendHeartBeats()
@@ -756,8 +907,8 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 type InstallSnapshotArgs struct {
 	Term              int         // Leader的Term
 	LeaderId          int         // 便于将客户端重定向给Leader
-	lastIncludedIndex int         // 将此前的entries全部替换掉
-	lastIncludedTerm  int         // lastIncludedIndex指向的快照的Term
+	LastIncludedIndex int         // 将此前的entries全部替换掉
+	LastIncludedTerm  int         // lastIncludedIndex指向的快照的Term
 	Data              []byte      // 快照
 	LastIncludedCmd   interface{} // 用于在0处占位
 }
